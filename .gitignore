@@ -1,0 +1,22 @@
+# Binaries and static libraries
+bin/
+lib/
+src/*.o
+
+# Test and runtime databases
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.bin
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temporary test files
+test_*.bin
+test_*.db*
+unsafe_*.db*
+untorn_*.db*
+bench_*.db*

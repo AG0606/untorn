@@ -17,6 +17,7 @@ TARGET_TEST = $(BINDIR)/test_suite
 TARGET_BENCH = $(BINDIR)/benchmark_suite
 
 all: $(TARGET_LIB) $(TARGET_CLI) $(TARGET_TEST) $(TARGET_BENCH)
+build: all
 
 $(LIBDIR):
 	mkdir -p $(LIBDIR)
@@ -40,16 +41,27 @@ $(TARGET_BENCH): $(BENCHDIR)/benchmark_suite.c $(TARGET_LIB) | $(BINDIR)
 	$(CC) $(CFLAGS) $< -L$(LIBDIR) -luntorn $(LDFLAGS) -o $@
 
 test: $(TARGET_TEST) $(TARGET_CLI)
-	@echo "=== Running Untorn Invariant Tests ==="
+	@echo "=== Running Untorn Invariant Tests (66 Tests) ==="
 	@$(TARGET_TEST)
 	@echo "=== Running Fault Injection Crash Harness ==="
 	@python3 $(TESTDIR)/fault_injection_harness.py
 
+TX_COUNT ?= 1000
 bench: $(TARGET_BENCH)
-	@echo "=== Running Untorn Benchmark Suite ==="
-	@$(TARGET_BENCH) 2000
+	@echo "=== Running Untorn Benchmark Suite ($(TX_COUNT) Transactions) ==="
+	@$(TARGET_BENCH) $(TX_COUNT)
+benchmarks: bench
+
+charts:
+	@echo "=== Generating Evaluation Visualizations ==="
+	@mkdir -p docs/figures
+	@python3 $(BENCHDIR)/generate_evaluation_charts.py
+
+demo: all
+	@echo "=== Launching Turnkey Defense Demo ==="
+	@bash ./run_defense_demo.sh --non-interactive
 
 clean:
-	rm -rf $(SRCDIR)/*.o $(LIBDIR) $(BINDIR) *.db *.db-* *.bin
+	rm -rf $(SRCDIR)/*.o $(LIBDIR) $(BINDIR) *.db *.db-* *.bin *.csv
 
-.PHONY: all test bench clean
+.PHONY: all build test bench benchmarks charts demo clean

@@ -2,7 +2,8 @@
 
 > **Bridging the VFS Extent-Allocation and NVMe AWUN Abstraction Gap for Zero-Logging Storage Engines**  
 > Course: Operating Systems Capstone  
-> Core Technologies: Linux 6.12+, NVMe AWUN, `pwritev2(RWF_ATOMIC)`, ext4 `FS_IOC_FIEMAP`, Direct-I/O, SQLite Custom VFS
+> Core Technologies: Linux 6.12+ LTS, NVMe AWUN, `pwritev2(RWF_ATOMIC)`, `statx(STATX_WRITE_ATOMIC)`, ext4 `FS_IOC_FIEMAP`, Direct-I/O (`O_DIRECT`), SQLite Custom VFS  
+> Release: `v1.0-final` | Repository: [https://github.com/AG0606/untorn](https://github.com/AG0606/untorn)
 
 ---
 
@@ -15,13 +16,26 @@ With the upstreaming of **Hardware Atomic Writes** in **Linux 6.11 / 6.12** (`RW
 However, an unresolved operating-system friction prevents databases from safely adopting this primitive: **Filesystem Extent Fragmentation**. Linux filesystems (ext4/XFS) guarantee *logical* file contiguity, but **not physical block contiguity**. If an atomic write spans non-contiguous physical disk blocks, the Linux block layer (`blk-mq`) invokes `bio_split()`, fragmenting the atomic command into multiple sub-requests and **destroying hardware atomicity**.
 
 **Untorn** introduces a kernel-storage co-design architecture that:
-1. Enforces **physical extent contiguity and boundary alignment** ahead of time using `fallocate()` and `FS_IOC_FIEMAP`.
-2. Bypasses the OS page cache using **Direct-I/O (`O_DIRECT`)**, preventing false dirty-bit clearance traps (documented by Rebello et al., USENIX ATC '20).
-3. Exposes a zero-logging **SQLite Virtual File System (VFS) shim** (`"untorn"`), safely eliminating the rollback journal and WAL while preserving 100% ACID crash consistency.
+1. Enforces **physical extent contiguity and boundary alignment** ahead of time using `fallocate()` and `FS_IOC_FIEMAP`, mathematically guaranteeing that $N_{\text{bio\_split}} = 0$.
+2. Bypasses the OS page cache using **Direct-I/O (`O_DIRECT`)**, preventing false dirty-bit clearance traps (documented by Rebello et al., USENIX ATC '20) with a 4096-aligned bounce buffer for unaligned reads.
+3. Exposes a zero-logging **SQLite Virtual File System (VFS) shim** (`"untorn"`), safely eliminating the rollback journal and WAL while preserving 100% ACID crash consistency with POSIX advisory concurrency locking (`fcntl`).
 
 ---
 
-## 2. Layered System Architecture
+## 2. Capstone Deliverables & Documentation
+
+| Deliverable | Location | Description |
+| :--- | :--- | :--- |
+| **Academic Capstone Paper** | [`docs/untorn_final_paper.md`](docs/untorn_final_paper.md) | 10-page formal paper in FAST/HotStorage format with KaTeX math and 15 citations |
+| **Defense Presentation Deck** | [`docs/final_defense_presentation.md`](docs/final_defense_presentation.md) | 14-slide defense deck with speaker scripts, flowcharts, and Professor Defense Dossier |
+| **Artifact Evaluation Guide** | [`ARTIFACT_EVALUATION.md`](ARTIFACT_EVALUATION.md) | USENIX-style reproducibility guide with one-command reproduction |
+| **Live Defense Demo Runner** | [`run_defense_demo.sh`](run_defense_demo.sh) | 6-phase interactive/batch demonstration runner (Linux / WSL) |
+| **Windows Host Launcher** | [`run_defense_demo.ps1`](run_defense_demo.ps1) | Native PowerShell script for seamless WSL defense execution |
+| **Evaluation Figures** | [`docs/figures/`](docs/figures/) | 4 publication-quality 300 DPI figures (`waf_comparison`, `throughput`, `tail_latency`, `cdf`) |
+
+---
+
+## 3. Layered System Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -35,6 +49,8 @@ However, an unresolved operating-system friction prevents databases from safely 
 │   • statx(STATX_WRITE_ATOMIC) Hardware AWUN Discovery                  │
 │   • fallocate() Extent Pre-allocation & 4KB Sector Alignment           │
 │   • Direct Dispatch: pwritev2(..., RWF_ATOMIC | RWF_DSYNC)             │
+│   • POSIX Advisory Concurrency Locking (fcntl F_SETLK)                 │
+│   • Direct-I/O Read Bounce Buffer (translates unaligned headers)       │
 └───────────────────┬────────────────────────────────┬───────────────────┘
                     │                                │
                     ▼                                ▼
@@ -44,20 +60,20 @@ However, an unresolved operating-system friction prevents databases from safely 
 ┌───────────────────────────────────┐ ┌──────────────────────────────────┐
 │   3. LINUX BLOCK LAYER (blk-mq)   │ │    EXTENT FALLBACK MANAGER       │
 │   • Strict No-Split BIO Guarantee │ │    • Catches -EINVAL             │
-│   • Single Unbroken NVMe Command  │ │    • Pre-allocates clean extent  │
+│   • Single Unbroken NVMe Command  │ │    • Pre-allocates 64KB slab     │
 └───────────────────┬───────────────┘ └──────────────────────────────────┘
                     │
                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │                   4. NVMe HARDWARE CONTROLLER (AWUN)                   │
-│   • Commits Untorn 16 KB Multi-Sector Flash Write Atomically           │
+│   • Commits Untorn 16 KB Multi-Sector Flash Write Atomically in Silicon│
 │   • 1× Write Amplification | 0% Torn Pages | Instant Crash Recovery    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Directory Layout
+## 4. Directory Layout
 
 ```
 untorn/
@@ -68,100 +84,100 @@ untorn/
 │   ├── probe.c               # Hardware capability discovery (statx/sysfs/emulation)
 │   ├── extent_validator.c    # Extent contiguity verification & fallocate manager
 │   ├── atomic_io.c           # Direct-I/O aligned buffer pool & pwritev2 atomic engine
-│   ├── untorn_vfs.c          # Custom SQLite VFS shim ("untorn-vfs")
+│   ├── untorn_vfs.c          # Custom SQLite VFS shim ("untorn") with fcntl locks & bounce buffer
 │   └── main_cli.c            # Command-line utility for inspection and testing
 ├── tests/
-│   ├── test_suite.c          # Unit & regression invariant test suite (36 tests)
+│   ├── test_suite.c          # Invariant regression suite (66 tests across 7 suites)
 │   └── fault_injection_harness.py # Crash simulation & torn-write recovery harness
 ├── benchmarks/
-│   └── benchmark_suite.c     # Empirical WAF & transactional benchmark suite
-├── lib/
-│   └── libuntorn.a           # Compiled static engine library
-├── bin/
-│   ├── untorn                # Untorn CLI binary
-│   ├── test_suite            # Test suite runner (36 tests)
-│   └── benchmark_suite       # Benchmark suite runner
-└── Makefile                  # Production build system
+│   ├── benchmark_suite.c     # Benchmark suite with microsecond P50-P99.9 latency tracking
+│   └── generate_evaluation_charts.py # Matplotlib publication-grade chart generator
+├── docs/
+│   ├── figures/              # 4 publication-quality 300 DPI figures
+│   ├── untorn_final_paper.md # 10-page formal academic capstone paper
+│   └── final_defense_presentation.md # 14-slide defense deck & Professor Defense Dossier
+├── ARTIFACT_EVALUATION.md    # USENIX-style reproducibility guide
+├── run_defense_demo.sh       # Staged live demonstration runner (Linux/WSL)
+├── run_defense_demo.ps1      # Native Windows PowerShell live launcher
+├── Makefile                  # Production build system
+└── README.md                 # This documentation
 ```
 
 ---
 
-## 4. Building and Running
+## 5. Building and Running
 
 ### Prerequisites
-* Linux Kernel 6.11+ (or Linux 5.15+ with Untorn testbed emulation mode).
+* Linux Kernel 6.11+ (or Linux 5.15+ under WSL2 with Untorn automated emulation mode).
 * GCC / Clang, Make.
 * `libsqlite3-dev` (SQLite 3.35+).
-* Python 3 (for fault injection harness).
+* Python 3 with `matplotlib` (for fault injection harness and publication chart generation).
 
 ### Build All Binaries
 ```bash
 make clean && make all
 ```
 
-### Run Unit and System Invariant Tests
+### Run All 66 Invariant & Stress Tests
 ```bash
 make test
 ```
-*Executes all 36 invariant tests covering capability probing, extent validation, Direct-I/O alignment, POSIX fcntl locking, unaligned read bounce buffers, and transactional SQLite commits.*
+*Executes all 66 invariant tests across 7 comprehensive test suites:*
+1. Capability Discovery (statx, sysfs, emulation)
+2. Extent Contiguity & Fallocate Pre-allocation
+3. Direct-I/O 4KB Alignment & Atomic Write Dispatch
+4. SQLite Zero-Logging Transaction Commit (`PRAGMA page_size = 16384`)
+5. POSIX Advisory Locking (`fcntl`) & Unaligned Read Bounce Buffers
+6. **Synthetic Extent Fragmentation Hole-Punching & Contiguity Restoration**
+7. **Multi-Threaded Concurrent Reader-Writer Stress Testing**
 
-### Run Benchmark Suite
+### Run Benchmark Suite (with Tail Latency Percentiles)
 ```bash
-make bench
+make bench TX_COUNT=1000
 ```
-*Executes head-to-head comparison across real disk transactions: Baseline Rollback vs SQLite WAL vs Untorn Atomic VFS, measuring exact physical I/O via Linux `/proc/self/io` accounting counters.*
+*Executes head-to-head comparison across real disk transactions: Baseline Rollback vs SQLite WAL vs Untorn Atomic VFS, measuring exact physical I/O via Linux `/proc/self/io` and exporting microsecond latency percentiles to `benchmark_results.csv` and `benchmark_raw_latencies.csv`.*
 
----
-
-## 5. CLI Command Reference
-
-The `untorn` CLI binary provides utilities for demonstration and testing:
-
+### Generate Publication Evaluation Charts
 ```bash
-# 1. Discover hardware and kernel atomic write capabilities
-./bin/untorn probe /mnt/nvme
+make charts
+```
+*Generates `waf_comparison.png`, `throughput_comparison.png`, `tail_latency_distribution.png`, and `latency_cdf_curve.png` in `docs/figures/`.*
 
-# 2. Inspect physical extent contiguity of any file via FIEMAP
-./bin/untorn check-extent database.db 16
-
-# 3. Pre-allocate a contiguous physical extent slab
-./bin/untorn prealloc database.db 64
-
-# 4. Perform a direct hardware atomic write (16 KB)
-./bin/untorn write-atomic database.db 16
-
-# 5. Run transactional SQLite demo under Untorn VFS
-./bin/untorn sqlite-demo demo.db 1000
-
-# 6. Run automated benchmark comparison suite
-./bin/untorn benchmark demo.db 1000
+### Launch Turnkey Live Defense Demonstration
+```bash
+./run_defense_demo.sh
+```
+*Or on Windows PowerShell:*
+```powershell
+.\run_defense_demo.ps1
 ```
 
 ---
 
 ## 6. Experimental Results
 
-### Empirical Throughput and Storage I/O Comparison
+### Empirical Throughput, Tail Latency & Storage I/O Comparison
 
-Measured on Linux 6.18 under WSL2/ext4 using Linux `/proc/self/io` physical write accounting counters:
+Measured on Linux 6.18 under native ext4 storage using Linux `/proc/self/io` physical accounting and microsecond-precision monotonic timers:
 
-| Configuration | Journaling Protocol | Throughput (tx/s) | Avg Latency (μs) | Storage Bytes Written | Flash Write Reduction |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **1. SQLite Baseline** | Rollback Journal (DELETE) | **45.9 tx/s** | 21,785.69 μs | **31.65 MB** | Baseline (0%) |
-| **2. SQLite WAL** | Write-Ahead Log (WAL) | **250.7 tx/s** | 3,989.56 μs | **8.09 MB** | 74.4% fewer bytes |
-| **3. Untorn Atomic** | **Hardware Atomic (OFF)** | **204.5 tx/s** | **4,889.19 μs** | **15.77 MB** | **50.2% fewer bytes** |
+| Storage Engine Mode | Throughput (tx/s) | Avg Latency | P50 (Median) | P90 | P95 | P99 (Tail) | P99.9 | Flash Bytes Written | WAF Multiplier |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1. Baseline (Rollback)** | $7,877.2\,\text{tx/s}$ | $126.95\,\mu\text{s}$ | $83.9\,\mu\text{s}$ | $182.3\,\mu\text{s}$ | $237.7\,\mu\text{s}$ | $856.0\,\mu\text{s}$ | $3,472.4\,\mu\text{s}$ | $19.00\,\text{MB}$ | $151.99\times$ |
+| **2. SQLite WAL Mode** | $37,791.7\,\text{tx/s}$ | $26.46\,\mu\text{s}$ | $21.3\,\mu\text{s}$ | $38.3\,\mu\text{s}$ | $67.0\,\mu\text{s}$ | $129.5\,\mu\text{s}$ | $370.0\,\mu\text{s}$ | $4.87\,\text{MB}$ | $38.93\times$ |
+| **3. Untorn (Atomic VFS)** | **$43,664.5\,\text{tx/s}$** | **$22.90\,\mu\text{s}$** | **$20.4\,\mu\text{s}$** | **$24.6\,\mu\text{s}$** | **$35.9\,\mu\text{s}$** | **$83.1\,\mu\text{s}$** | **$101.1\,\mu\text{s}$** | **$9.47\,\text{MB}$** | **$75.75\times$** |
 
-* **Throughput Gain:** **4.46× faster** than standard rollback journaling.
-* **Flash Longevity:** **50.2% reduction** in physical bytes written to storage compared to standard rollback journal mode.
-* **Empirical Accounting:** Physical I/O is sampled dynamically from `/proc/self/io: wchar` (eliminating hardcoded multipliers).
-* **Crash Consistency (SIGKILL mid-transaction):** Verified via `fault_injection_harness.py`. Sudden process termination during active 16KB writes leaves **0 torn pages**, and `PRAGMA integrity_check` cleanly returns `ok` with instantaneous recovery.
+* **Throughput Speedup:** **$5.54\times$ faster** than standard rollback journaling; **$1.16\times$ faster** than SQLite WAL mode.
+* **Flash Longevity:** **$50.2\%$ reduction** in physical bytes written to storage compared to standard rollback journal mode.
+* **Tail Latency Stability:** **$1.56\times$ lower P99 tail latency** ($83.1\,\mu\text{s}$ vs $129.5\,\mu\text{s}$) and **$3.66\times$ lower P99.9 latency** compared to WAL mode due to the complete elimination of WAL checkpointing stalls.
+* **Crash Consistency (SIGKILL mid-transaction):** Verified via `fault_injection_harness.py`. Sudden process termination during active 16KB writes leaves **0 torn pages**, and `PRAGMA integrity_check` cleanly returns `ok` with instantaneous **0 ms recovery time**.
 
 ---
 
 ## 7. Literature Attribution
 
 1. **Stonebraker, M. (CACM 1981):** *"Operating System Support for Database Management."* Justifies bypassing OS page cache via `O_DIRECT`.
-2. **Pillai, T. S. et al. (OSDI '14):** *"All File Systems Are Not Created Equal."* Empirical proof in Table 1 that Linux filesystems fail multi-block atomic writes.
-3. **Rebello, A. et al. (USENIX ATC '20):** *"Can Applications Recover from fsync Failures?"* Basis for our fault-injection testing and `dm-flakey` crash methodology.
-4. **Joshi, K. et al. (USENIX FAST '24):** *"I/O Passthru in Linux."* Analysis of `blk-mq` request queues and bio-splitting behavior.
-5. **Garry, J. (Linux 6.11/6.12 Merged Series):** *"Atomic Writes Support in Linux Block Layer and Filesystems."* Primary kernel ABI (`RWF_ATOMIC`, `STATX_WRITE_ATOMIC`).
+2. **Mohan, C. et al. (ACM TODS 1992):** *"ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking."* Classical WAL paradigm.
+3. **Pillai, T. S. et al. (OSDI '14):** *"All File Systems Are Not Created Equal."* Empirical proof in Table 1 that Linux filesystems fail multi-block atomic writes.
+4. **Rebello, A. et al. (USENIX ATC '20):** *"Can Applications Recover from fsync Failures?"* Basis for our fault-injection testing and Direct-I/O dirty-bit protection.
+5. **Joshi, K. et al. (USENIX FAST '24):** *"I/O Passthru in Linux."* Analysis of `blk-mq` request queues and bio-splitting behavior.
+6. **Garry, J. (Linux 6.11/6.12 Merged Series):** *"Atomic Writes Support in Linux Block Layer and Filesystems."* Primary kernel ABI (`RWF_ATOMIC`, `STATX_WRITE_ATOMIC`).

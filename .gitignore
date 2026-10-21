@@ -14,6 +14,9 @@ src/*.o
 __pycache__/
 *.pyc
 
+# Agent teamwork metadata
+.agents/
+
 # Temporary test files
 test_*.bin
 test_*.db*

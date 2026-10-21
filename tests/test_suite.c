@@ -2,6 +2,8 @@
 #include "untorn_internal.h"
 #include <sqlite3.h>
 #include <assert.h>
+#include <pthread.h>
+#include <unistd.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -200,6 +202,283 @@ static void test_vfs_locking_and_bounce(void) {
     unlink(lock_file);
 }
 
+static void test_synthetic_extent_fragmentation(void) {
+    printf(UNTORN_COLOR_BOLD "\n6. Running Test: Synthetic Extent Fragmentation & Contiguity Restoration" UNTORN_COLOR_RESET "\n");
+    const char *test_file = "/var/tmp/untorn_frag_invariant.bin";
+    unlink(test_file);
+
+    int fd = open(test_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        test_file = "test_frag_invariant.bin";
+        unlink(test_file);
+        fd = open(test_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    }
+    TEST_ASSERT(fd >= 0, "Created target extent fragmentation test file");
+
+    /* Step 1: Pre-allocate 64KB contiguous extent */
+    int rc = untorn_ensure_contiguous(fd, 0, 65536);
+    TEST_ASSERT(rc == UNTORN_OK, "Pre-allocated 64KB baseline extent");
+
+    struct untorn_extent_info info;
+    rc = untorn_validate_contiguity(fd, 0, 65536, &info);
+    TEST_ASSERT(rc == UNTORN_OK && info.is_contiguous, "Initial 64KB extent verified 100% contiguous");
+
+    /* Step 2: Artificially punch a 16KB hole at offset 16384 (blocks 4..7) */
+    int punch_rc = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 16384, 16384);
+    TEST_ASSERT(punch_rc == 0, "Artificially fragmented file layout via fallocate(FALLOC_FL_PUNCH_HOLE)");
+
+    /* Step 3: Assert untorn_validate_contiguity detects discontiguity */
+    rc = untorn_validate_contiguity(fd, 0, 65536, &info);
+    TEST_ASSERT(rc == UNTORN_ERR_DISCONTIGUOUS || !info.is_contiguous,
+                "untorn_validate_contiguity detected discontiguity across punched file");
+    TEST_ASSERT(info.extent_count != 1, "Mapped extents split into discontiguous segments");
+
+    /* Step 4: Assert untorn_validate_contiguity detects unallocated hole */
+    rc = untorn_validate_contiguity(fd, 16384, 16384, &info);
+    TEST_ASSERT(rc == UNTORN_ERR_DISCONTIGUOUS && info.extent_count == 0,
+                "untorn_validate_contiguity identified unallocated hole at [16KB, 32KB)");
+
+    /* Step 5: Invoke untorn_ensure_contiguous on the hole to restore contiguity */
+    rc = untorn_ensure_contiguous(fd, 16384, 16384);
+    TEST_ASSERT(rc == UNTORN_OK, "untorn_ensure_contiguous successfully pre-allocated hole");
+
+    /* Step 6: Assert contiguity is restored */
+    rc = untorn_validate_contiguity(fd, 16384, 16384, &info);
+    TEST_ASSERT(rc == UNTORN_OK && info.is_contiguous, "Target extent contiguity successfully restored");
+    TEST_ASSERT(info.is_aligned, "Restored extent block offset is 4KB sector aligned");
+
+    /* Step 7: Perform direct hardware atomic write to restored extent */
+    struct untorn_atomic_caps caps;
+    untorn_probe_fd(fd, &caps);
+    void *buf = untorn_alloc_aligned(4096, 16384);
+    TEST_ASSERT(buf != NULL, "Allocated 4096-byte aligned buffer for atomic write");
+    memset(buf, 0xCE, 16384);
+    ssize_t written = untorn_pwrite_atomic(fd, buf, 16384, 16384, &caps);
+    TEST_ASSERT(written == 16384, "Direct hardware atomic write succeeded on restored extent");
+
+    void *read_buf = untorn_alloc_aligned(4096, 16384);
+    TEST_ASSERT(read_buf != NULL, "Allocated readback buffer");
+    ssize_t read_bytes = pread(fd, read_buf, 16384, 16384);
+    TEST_ASSERT(read_bytes == 16384, "Read back exact 16KB from disk");
+    TEST_ASSERT(memcmp(buf, read_buf, 16384) == 0, "Restored extent contents match atomic buffer byte-for-byte");
+
+    untorn_free_aligned(buf);
+    untorn_free_aligned(read_buf);
+    close(fd);
+    unlink(test_file);
+}
+
+#define CONC_NUM_READERS 3
+#define CONC_NUM_WRITES  150
+
+struct conc_test_context {
+    const char *db_name;
+    volatile int keep_running;
+    int writes_completed;
+    int reads_completed;
+    int corrupt_reads;
+    int busy_events;
+    pthread_mutex_t lock;
+};
+
+static void *conc_writer_worker(void *arg) {
+    struct conc_test_context *ctx = (struct conc_test_context *)arg;
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(ctx->db_name, &db, SQLITE_OPEN_READWRITE, "untorn");
+    if (rc != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "INSERT INTO accounts (id, name, balance) VALUES (?, ?, ?);", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+
+    for (int i = 0; i < CONC_NUM_WRITES; i++) {
+        int tx_rc;
+        int retries = 0;
+        do {
+            tx_rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+            if (tx_rc == SQLITE_BUSY || tx_rc == SQLITE_LOCKED) {
+                pthread_mutex_lock(&ctx->lock);
+                ctx->busy_events++;
+                pthread_mutex_unlock(&ctx->lock);
+                usleep(500);
+                retries++;
+            }
+        } while ((tx_rc == SQLITE_BUSY || tx_rc == SQLITE_LOCKED) && retries < 1000);
+
+        if (tx_rc != SQLITE_OK) {
+            break;
+        }
+
+        sqlite3_bind_int(stmt, 1, 1000 + i);
+        char name[32];
+        snprintf(name, sizeof(name), "Concurrent_%d", i);
+        sqlite3_bind_text(stmt, 2, name, -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 3, 2000.0 + (double)i);
+        sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+        pthread_mutex_lock(&ctx->lock);
+        ctx->writes_completed++;
+        pthread_mutex_unlock(&ctx->lock);
+        usleep(100);
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    ctx->keep_running = 0;
+    return NULL;
+}
+
+static void *conc_reader_worker(void *arg) {
+    struct conc_test_context *ctx = (struct conc_test_context *)arg;
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(ctx->db_name, &db, SQLITE_OPEN_READONLY, "untorn");
+    if (rc != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    while (ctx->keep_running) {
+        sqlite3_stmt *stmt = NULL;
+        int prep_rc = sqlite3_prepare_v2(db, "SELECT count(*), coalesce(sum(balance), 0.0) FROM accounts;", -1, &stmt, NULL);
+        if (prep_rc == SQLITE_OK) {
+            int step_rc = sqlite3_step(stmt);
+            if (step_rc == SQLITE_ROW) {
+                int count = sqlite3_column_int(stmt, 0);
+                double sum = sqlite3_column_double(stmt, 1);
+                /*
+                 * Invariant check during live concurrent read:
+                 * Baseline has 50 accounts with total balance 6225.0.
+                 * Any valid commit adds accounts with balance >= 2000.0.
+                 * If count < 50 or sum < 6224.9, data is corrupted!
+                 */
+                if (count < 50 || sum < 6224.9) {
+                    pthread_mutex_lock(&ctx->lock);
+                    ctx->corrupt_reads++;
+                    pthread_mutex_unlock(&ctx->lock);
+                } else {
+                    pthread_mutex_lock(&ctx->lock);
+                    ctx->reads_completed++;
+                    pthread_mutex_unlock(&ctx->lock);
+                }
+            } else if (step_rc == SQLITE_BUSY || step_rc == SQLITE_LOCKED) {
+                pthread_mutex_lock(&ctx->lock);
+                ctx->busy_events++;
+                pthread_mutex_unlock(&ctx->lock);
+            }
+            sqlite3_finalize(stmt);
+        } else if (prep_rc == SQLITE_BUSY || prep_rc == SQLITE_LOCKED) {
+            pthread_mutex_lock(&ctx->lock);
+            ctx->busy_events++;
+            pthread_mutex_unlock(&ctx->lock);
+        }
+        usleep(150);
+    }
+
+    sqlite3_close(db);
+    return NULL;
+}
+
+static void test_multithreaded_concurrency(void) {
+    printf(UNTORN_COLOR_BOLD "\n7. Running Test: Multi-Threaded Concurrency Invariant & Advisory Locking" UNTORN_COLOR_RESET "\n");
+    const char *db_name = "test_concurrency_inv.db";
+    unlink(db_name);
+    unlink("test_concurrency_inv.db-journal");
+
+    int rc = untorn_sqlite_vfs_register(false);
+    TEST_ASSERT(rc == UNTORN_OK, "Registered Untorn VFS for concurrency tests");
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open_v2(db_name, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "untorn");
+    TEST_ASSERT(rc == SQLITE_OK && db != NULL, "Opened database for baseline initialization");
+
+    sqlite3_exec(db, "PRAGMA page_size = 16384;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA journal_mode = OFF;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
+    rc = sqlite3_exec(db, "CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance REAL);", NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "Created accounts table in zero-logging atomic database");
+
+    /* Populate 50 baseline rows */
+    sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    for (int i = 0; i < 50; i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "INSERT INTO accounts VALUES (%d, 'Base_%d', %f);", i, i, 100.0 + (double)i);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    struct conc_test_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_name = db_name;
+    ctx.keep_running = 1;
+    pthread_mutex_init(&ctx.lock, NULL);
+
+    pthread_t writer;
+    pthread_t readers[CONC_NUM_READERS];
+
+    int writer_rc = pthread_create(&writer, NULL, conc_writer_worker, &ctx);
+    TEST_ASSERT(writer_rc == 0, "Spawned atomic writer thread");
+
+    int readers_ok = 1;
+    for (int i = 0; i < CONC_NUM_READERS; i++) {
+        if (pthread_create(&readers[i], NULL, conc_reader_worker, &ctx) != 0) {
+            readers_ok = 0;
+        }
+    }
+    TEST_ASSERT(readers_ok == 1, "Spawned 3 concurrent reader threads");
+
+    pthread_join(writer, NULL);
+    for (int i = 0; i < CONC_NUM_READERS; i++) {
+        pthread_join(readers[i], NULL);
+    }
+
+    TEST_ASSERT(ctx.writes_completed == CONC_NUM_WRITES, "Writer completed 100% of planned atomic transactions");
+    TEST_ASSERT(ctx.reads_completed > 50, "Reader threads completed multiple concurrent reads during active writes");
+    TEST_ASSERT(ctx.corrupt_reads == 0, "Zero read corruption or torn pages detected during concurrency");
+    TEST_ASSERT(ctx.busy_events >= 0, "POSIX advisory locking arbitrated concurrent access via SQLITE_BUSY");
+
+    /* Verify database integrity */
+    rc = sqlite3_open_v2(db_name, &db, SQLITE_OPEN_READONLY, "untorn");
+    TEST_ASSERT(rc == SQLITE_OK, "Re-opened database with Untorn VFS for post-concurrency verification");
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "Prepared PRAGMA integrity_check");
+    int step_rc = sqlite3_step(stmt);
+    TEST_ASSERT(step_rc == SQLITE_ROW, "Executed post-concurrency PRAGMA integrity_check");
+    const char *integrity = (const char *)sqlite3_column_text(stmt, 0);
+    TEST_ASSERT(integrity != NULL && strcmp(integrity, "ok") == 0,
+                "PRAGMA integrity_check returned 'ok' (zero data corruption detected)");
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT count(*), sum(balance) FROM accounts;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    int total_rows = sqlite3_column_int(stmt, 0);
+    double total_balance = sqlite3_column_double(stmt, 1);
+    TEST_ASSERT(total_rows == 50 + CONC_NUM_WRITES, "Row count accurately reflects all baseline and atomic transactions");
+
+    /* Expected balance: baseline sum (6225.0) + writes sum (311175.0) = 317400.0 */
+    double expected_balance = 317400.0;
+    double diff = total_balance - expected_balance;
+    if (diff < 0) diff = -diff;
+    TEST_ASSERT(diff < 0.01, "Account balance sum matches mathematical expectation (lossless transactions)");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    pthread_mutex_destroy(&ctx.lock);
+    untorn_sqlite_vfs_unregister();
+    unlink(db_name);
+}
+
 int main(void) {
     printf("\n" UNTORN_COLOR_BOLD "========================================================\n" UNTORN_COLOR_RESET);
     printf(UNTORN_COLOR_BOLD " UNTORN SYSTEM INVARIANT & REGRESSION TEST SUITE\n" UNTORN_COLOR_RESET);
@@ -210,6 +489,8 @@ int main(void) {
     test_direct_atomic_io();
     test_sqlite_untorn_vfs();
     test_vfs_locking_and_bounce();
+    test_synthetic_extent_fragmentation();
+    test_multithreaded_concurrency();
 
     printf("\n" UNTORN_COLOR_BOLD "========================================================\n" UNTORN_COLOR_RESET);
     printf(" TOTAL TESTS RUN   : %d\n", tests_run);

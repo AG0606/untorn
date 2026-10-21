@@ -55,13 +55,17 @@ benchmarks: bench
 charts:
 	@echo "=== Generating Evaluation Visualizations ==="
 	@mkdir -p docs/figures
-	@python3 $(BENCHDIR)/generate_evaluation_charts.py
+	@python3 $(BENCHDIR)/generate_evaluation_charts.py 2>/dev/null || python $(BENCHDIR)/generate_evaluation_charts.py
 
 demo: all
 	@echo "=== Launching Turnkey Defense Demo ==="
+	@chmod +x ./run_defense_demo.sh
 	@bash ./run_defense_demo.sh --non-interactive
 
 clean:
-	rm -rf $(SRCDIR)/*.o $(LIBDIR) $(BINDIR) *.db *.db-* *.bin *.csv
+	rm -rf $(SRCDIR)/*.o $(LIBDIR) $(BINDIR) *.db *.db-* *.bin demo_*.db* test_*.db* bench_*.db* unsafe_*.db* untorn_*.db*
 
-.PHONY: all build test bench benchmarks charts demo clean
+distclean: clean
+	rm -f benchmark_results.csv benchmark_raw_latencies.csv
+
+.PHONY: all build test bench benchmarks charts demo clean distclean
